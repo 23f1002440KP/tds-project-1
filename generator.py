@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 import json
 import base64 
 import logging
-from typing import Dict, Any, Optional,List
+from typing import Dict, Any, Optional,List,Union, Iterable
 from pydantic import BaseModel, Field, ValidationError
 
 logger = logging.getLogger(__name__)
@@ -37,32 +37,113 @@ class GenerateCodeLLM:
         self.token = AI_PIPE_TOKEN
         
         
-    def _process_attachments(self, attachments: List[Dict[str, Any]]) -> str:
-        """Decodes base64 attachments and formats them for the LLM prompt."""
-        processed_data = []
-        for attachment in attachments:
-            url = attachment.get("url", "")
-            name = attachment.get("name", "attachment")
-            
+    def _process_attachments(self,attachments: Union[str, Dict[str, Any], Iterable[Union[str, Dict[str, Any]]]]) -> str:
+        """Accepts a single attachment or an iterable of attachments.
+
+        Each attachment may be:
+        - a data URI string (data:...;base64,AAA...)
+        - a plain URL string (http(s)://... or file://...)
+        - a dict with keys 'url' and optional 'name'
+
+        The function will decode data: URIs (base64) for non-image types and return a formatted
+        summary. For image data URIs it will NOT decode — the data URI is preserved as an attachment.
+        For non-data URLs it will include the URL as a reference.
+        No network requests are made.
+        """
+        # normalize to a list
+        items: List[Union[str, Dict[str, Any]]] = []
+        if isinstance(attachments, (str, dict)):
+            items = [attachments]
+        else:
+            try:
+                items = list(attachments)
+            except TypeError:
+                # fallback: treat as single string
+                items = [str(attachments)]
+
+        processed_data: List[str] = []
+
+        for idx, attachment in enumerate(items):
+            # normalize dict form
+            if isinstance(attachment, dict):
+                url = attachment.get("url", "")
+                name = attachment.get("name") or attachment.get("filename") or f"attachment_{idx}"
+            else:
+                url = str(attachment)
+                name = f"attachment_{idx}"
+
+            if not url:
+                print(f"Warning: empty url for {name} (index {idx})")
+                continue
+
             if url.startswith("data:"):
+                # data:[<mediatype>][;base64],<data>
                 try:
-                    _, encoded_data = url.split(',', 1)
+                    header, encoded_data = url.split(',', 1)
                 except ValueError:
                     print(f"Error: Invalid data URI format for {name}")
                     continue
 
-                try:
-                    decoded_content = base64.b64decode(encoded_data).decode('utf-8')
-                    sample_content = decoded_content[:1000] 
-                    
+                # get media type (may be empty)
+                media_type = header[5:].split(';')[0].lower() if len(header) > 5 else ""
+
+                # If it's an image, do not decode: preserve the data URI as an attachment reference.
+                if media_type.startswith("image/"):
                     processed_data.append(
                         f"## Attached File: {name}\n"
-                        f"--- Content Sample ---\n"
-                        f"{sample_content}\n"
-                        f"----------------------\n"
+                        f"Content-Type: {media_type or 'image/*'}\n"
+                        f"Note: image data URI preserved as attachment (not decoded) and you can use it directly\n"
+                        f"Data-URI: {url}\n"
                     )
-                except Exception as e:
-                    print(f"Error decoding attachment {name}: {e}")
+                    continue
+
+                # detect base64 marker for non-image types
+                is_base64 = header.endswith(";base64") or ";base64;" in header
+
+                if is_base64:
+                    try:
+                        # base64 may include padding/newlines
+                        decoded_bytes = base64.b64decode(encoded_data)
+                        # try utf-8, fallback to latin-1 to avoid losing bytes
+                        try:
+                            decoded_content = decoded_bytes.decode('utf-8')
+                        except UnicodeDecodeError:
+                            decoded_content = decoded_bytes.decode('latin-1')
+
+                        sample_content = decoded_content[:1000]
+                        processed_data.append(
+                            f"## Attached File: {name}\n"
+                            f"Content-Type: {media_type or header[5:]}\n"
+                            f"--- Content Sample ---\n"
+                            f"{sample_content}\n"
+                            f"----------------------\n"
+                        )
+                    except Exception as e:
+                        print(f"Error decoding base64 attachment {name}: {e}")
+                else:
+                    # data URI but not base64 - it's probably URL-encoded
+                    try:
+                        import urllib.parse
+
+                        decoded = urllib.parse.unquote(encoded_data)
+                        sample = decoded[:1000]
+                        processed_data.append(
+                            f"## Attached File: {name}\n"
+                            f"Content-Type: {media_type or header[5:]}\n"
+                            f"--- Content Sample (URL-decoded) ---\n"
+                            f"{sample}\n"
+                            f"----------------------\n"
+                        )
+                    except Exception as e:
+                        print(f"Error decoding URL-encoded data URI for {name}: {e}")
+
+            else:
+                # Not a data: URI. We won't fetch over network; just include reference.
+                processed_data.append(
+                    f"## Attached File: {name}\n"
+                    f"URL: {url}\n"
+                )
+
         return "\n".join(processed_data)
     
     def generate_app_files(self, task_request: dict) -> Dict[str, str]:
@@ -127,6 +208,7 @@ class GenerateCodeLLM:
                     {"role": "user", "content": prompt},
                 ]
         }
+        print(prompt)
         print("Sending request to LLM...")
         try:
             response = requests.post(url, headers=headers, json=payload)
